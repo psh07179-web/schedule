@@ -1057,11 +1057,25 @@
   const lastSavedAt = {}; // key -> timestamp of last local save
 
   // Firebase로 saveData/loadData 교체
-  window._fbSave = function(key, data) {
+  // 저장이 실제로 서버에 반영됐는지 확인하지 않고 넘어가면(fire-and-forget) 네트워크가
+  // 불안정할 때 조용히 유실될 수 있어서, 쓰기를 끝까지 기다리고(await) 실패 시 1회
+  // 재시도, 그래도 실패하면 사용자에게 명확히 알린다.
+  window._fbSave = async function(key, data) {
     lastSavedAt[key] = Date.now();
-    set(ref(db, 'schedules/' + key), data).catch(e => console.error('저장 오류', e));
-    // 로컬에도 캐시
+    // 로컬 캐시는 먼저 갱신(빠른 화면 반응용)
     try { localStorage.setItem(key, JSON.stringify(data)); } catch(e) {}
+    try {
+      await set(ref(db, 'schedules/' + key), data);
+    } catch (e) {
+      console.error('저장 오류, 재시도', e);
+      try {
+        await set(ref(db, 'schedules/' + key), data);
+      } catch (e2) {
+        console.error('저장 재시도 실패', e2);
+        alert('⚠️ 방금 작성한 내용이 서버에 저장되지 못했습니다.\n네트워크 상태를 확인한 뒤 다시 "저장"을 눌러주세요.\n(이 창을 닫기 전에는 내용이 남아있으니 저장을 다시 시도하세요.)');
+        throw e2;
+      }
+    }
   };
 
   window._fbLoad = function(key) {
@@ -1187,30 +1201,40 @@
     return merged;
   }
 
+  // 지금 이 순간 서버로 전송 중인 저장 요청 개수. 0보다 크면 "아직 저장이 끝나지 않았다"는 뜻.
+  // 탭/앱을 닫기 직전 경고를 띄우는 데 사용한다.
+  let pendingSaveCount = 0;
+
   async function saveDataByKey(key, data) {
     // 열람 전용 사용자는 어떤 경로로 호출되든 서버/로컬에 쓰지 않는다 (UI 잠금 + 이중 방어)
     if (!isEditor) return;
     const before = lastLoadedSnapshot[key] || null;
     let finalData = data;
 
-    // 저장 직전 서버의 실제 최신 상태를 한 번 확인해서, 그 사이 다른 기기가
-    // 추가/변경한 내용이 있으면 내 변경 내용과 합쳐서 저장한다 (덮어쓰기 방지)
-    if (before && window._fbGetFresh) {
-      try {
-        const remoteRaw = await window._fbGetFresh(key);
-        if (remoteRaw) {
-          const remote = normalizeData(remoteRaw);
-          finalData = mergeDayData(before, data, remote);
-        }
-      } catch(e) {}
-    }
+    pendingSaveCount++;
+    try {
+      // 저장 직전 서버의 실제 최신 상태를 한 번 확인해서, 그 사이 다른 기기가
+      // 추가/변경한 내용이 있으면 내 변경 내용과 합쳐서 저장한다 (덮어쓰기 방지)
+      if (before && window._fbGetFresh) {
+        try {
+          const remoteRaw = await window._fbGetFresh(key);
+          if (remoteRaw) {
+            const remote = normalizeData(remoteRaw);
+            finalData = mergeDayData(before, data, remote);
+          }
+        } catch(e) {}
+      }
 
-    lastLoadedSnapshot[key] = JSON.parse(JSON.stringify(finalData));
+      lastLoadedSnapshot[key] = JSON.parse(JSON.stringify(finalData));
 
-    if (window._fbSave) {
-      window._fbSave(key, finalData);
-    } else {
-      try { localStorage.setItem(key, JSON.stringify(finalData)); } catch(e) {}
+      if (window._fbSave) {
+        // 실제 서버 반영이 끝날 때까지 기다린다 (실패 시 위에서 재시도/알림 처리됨)
+        await window._fbSave(key, finalData);
+      } else {
+        try { localStorage.setItem(key, JSON.stringify(finalData)); } catch(e) {}
+      }
+    } finally {
+      pendingSaveCount--;
     }
 
     // 병합 결과가 지금 내가 편집하던 내용과 다를 수 있으므로(다른 기기가 추가한 항목 반영)
@@ -1221,7 +1245,7 @@
   }
 
   function saveData(y, m, d, data) {
-    saveDataByKey(storageKey(y, m, d), data);
+    return saveDataByKey(storageKey(y, m, d), data);
   }
 
   function loadData(y, m, d) {
@@ -1819,8 +1843,9 @@
     detailEditSnapshot = null;
   }
 
-  function saveDetail() {
+  async function saveDetail() {
     if (detailIndex < 0) return;
+    if (!isEditor) return;
     const titleVal = document.getElementById('detailTitleInput').value;
     const contentVal = document.getElementById('detailContent').value;
     const isDone = document.getElementById('detailCheckCircle').classList.contains('checked');
@@ -1833,7 +1858,20 @@
     data.lines[detailIndex] = displayTitle;
     data.details[detailIndex] = contentVal;
     data.checked[detailIndex] = isDone;
-    saveData(curYear, curMonth, selectedDay, data);
+
+    const msg = document.getElementById('detailSavedMsg');
+    msg.textContent = '저장 중…';
+    msg.style.opacity = '1';
+
+    try {
+      // 실제로 서버에 반영될 때까지 기다린다. 여기서 await하지 않으면
+      // 화면이 먼저 닫히거나 앱이 종료돼 요청이 중간에 끊길 수 있다.
+      await saveData(curYear, curMonth, selectedDay, data);
+    } catch (e) {
+      // 저장 실패는 _fbSave에서 이미 alert로 알림. 여기서는 상태 메시지만 정리.
+      msg.style.opacity = '0';
+      return;
+    }
 
     // 이 상세보기 세션에서 처음 저장하는 것이라면, 진입 시점 상태를 undo 1단계로 등록
     // (타이핑 중 자동저장이 반복돼도 여러 단계로 쌓이지 않도록 한 번만 등록)
@@ -1845,14 +1883,15 @@
     // 상세 화면 제목 입력란도 동기화
     document.getElementById('detailTitleInput').value = displayTitle;
 
-    const msg = document.getElementById('detailSavedMsg');
+    msg.textContent = '✓ 저장됨';
     msg.style.opacity = '1';
     setTimeout(() => { msg.style.opacity = '0'; }, 1800);
   }
 
-  // 뒤로가기
-  document.getElementById('backBtn').addEventListener('click', () => {
-    saveDetail();
+  // 뒤로가기 (저장이 끝난 뒤에 화면을 닫아서, 저장 중간에 화면이 넘어가 요청이
+  // 끊기는 일이 없도록 한다)
+  document.getElementById('backBtn').addEventListener('click', async () => {
+    await saveDetail();
     closeDetail();
   });
 
@@ -1949,6 +1988,34 @@
     });
   });
 
+  // ── 앱이 백그라운드로 가거나 닫힐 때 미저장 입력 강제 반영 ──
+  // 문제 상황: 타이핑 후 0.6초(디바운스)가 지나기 전에 앱을 끄거나, 뒤로가기 없이
+  // 바로 화면을 벗어나면 위 autoSaveTimer가 아예 실행되지 못한 채 사라진다.
+  // visibilitychange는 모바일에서 앱을 배경으로 보내거나 종료할 때 가장 먼저,
+  // 그리고 가장 안정적으로 발생하는 이벤트이므로 여기서 즉시 저장을 끝낸다.
+  function flushPendingDetailEdit() {
+    if (autoSaveTimer) {
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = null;
+      saveDetail();
+    }
+  }
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') flushPendingDetailEdit();
+  });
+  window.addEventListener('pagehide', flushPendingDetailEdit);
+
+  // 데스크톱 브라우저에서 탭을 닫으려 할 때, 아직 서버로 전송 중인 저장이 있으면
+  // (네트워크가 느려 완료되지 않은 상태) 확인창을 띄워 실수로 끄지 않도록 한다.
+  window.addEventListener('beforeunload', (e) => {
+    flushPendingDetailEdit();
+    if (pendingSaveCount > 0) {
+      e.preventDefault();
+      e.returnValue = '';
+      return '';
+    }
+  });
+
   // 상세 체크 토글
   document.getElementById('detailCheckRow').addEventListener('click', () => {
     document.getElementById('detailCheckCircle').classList.toggle('checked');
@@ -1986,9 +2053,9 @@
   });
 
   // 안드로이드 뒤로가기 버튼 지원
-  window.addEventListener('popstate', () => {
+  window.addEventListener('popstate', async () => {
     if (document.getElementById('detailScreen').classList.contains('slide-in')) {
-      saveDetail();
+      await saveDetail();
       closeDetail();
     }
   });
