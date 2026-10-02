@@ -415,6 +415,40 @@
     gap: 3px;
   }
   .off-slot-wrap { position: relative; }
+
+  /* 글쓰기 버튼: 휴무보드(2칸 높이 = 41px)와 같은 높이로 맞춰 윗줄/아랫줄이 밀리지 않게 한다 */
+  .write-btn {
+    flex-shrink: 0;
+    width: 36px; height: 41px;
+    margin-top: 1px;
+    margin-left: -4px;
+    border: none;
+    border-radius: 6px;
+    background: #4a8fe8;
+    color: #fff;
+    font-family: 'Noto Sans KR', sans-serif;
+    font-size: 9px;
+    font-weight: 700;
+    letter-spacing: -0.5px;
+    line-height: 1.2;
+    cursor: pointer;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 2px;
+    white-space: nowrap;
+    transition: background 0.15s, transform 0.1s;
+  }
+  .write-btn .write-icon { font-size: 14px; line-height: 1; }
+  .write-btn:hover { background: #3a7bd0; }
+  .write-btn:active { transform: scale(0.95); }
+  /* 날짜 글자는 한 줄로 고정해서 버튼이 생겨도 줄 높이가 늘어나지 않게 함 */
+  .memo-date-row { gap: 6px; }
+  .memo-date-row .memo-date-label { white-space: nowrap; overflow: hidden; }
+  @media (max-width: 380px) {
+    .memo-date-row .memo-date-label span { font-size: 19px; }
+  }
   .off-badge {
     width: 29px; height: 19px;
     border-radius: 5px;
@@ -438,6 +472,7 @@
   .off-badge[data-val="휴무"] { background: #f0a030; color: #fff; }
   .off-badge[data-val="오전"] { background: #4fc3f7; color: #06405c; }
   .off-badge[data-val="오후"] { background: #8bc34a; color: #234010; }
+  .off-badge[data-val="근무"] { background: #9b6bdb; color: #fff; }
   .off-badge-person[data-val]:not([data-val=""]) { background: #2b7ee8; color: #fff; }
 
   .off-dropdown {
@@ -472,6 +507,7 @@
   .off-drop-item[data-val="휴무"] { background: #f0a030; color: #fff; }
   .off-drop-item[data-val="오전"] { background: #4fc3f7; color: #06405c; }
   .off-drop-item[data-val="오후"] { background: #8bc34a; color: #234010; }
+  .off-drop-item[data-val="근무"] { background: #9b6bdb; color: #fff; }
   .off-drop-item.off-person-item { background: #2b7ee8; color: #fff; }
 
   body.read-only .off-badge { pointer-events: none !important; opacity: 0.4 !important; }
@@ -790,6 +826,7 @@
   body.read-only .drag-handle,
   body.read-only .memo-delete,
   body.read-only #saveBtn,
+  body.read-only #writeBtn,
   body.read-only #detailSaveBtn,
   body.read-only #undoBtnMain,
   body.read-only #undoBtnDetail,
@@ -904,6 +941,7 @@
       <div class="memo-date-row">
         <div class="memo-date-label" id="memoDateLabel"></div>
         <div class="off-duty-board" id="offDutyBoard"></div>
+        <button class="write-btn" id="writeBtn" type="button" title="새 메모 쓰기"><span class="write-icon">✏️</span>글쓰기</button>
       </div>
       <div class="read-only-badge">🔒 열람 전용 모드입니다. 우측 상단 자물쇠 아이콘을 눌러 로그인하면 수정할 수 있어요.</div>
       <div class="memo-lines" id="memoLines"></div>
@@ -1011,8 +1049,22 @@
     document.getElementById('authPassword').value = '';
     document.getElementById('authModal').classList.add('open');
     document.getElementById('authEmail').focus();
+    // 안드로이드 뒤로가기로 모달을 닫을 수 있도록 history 항목을 쌓는다
+    if (!authHistoryPushed) {
+      history.pushState({ screen: 'auth' }, '');
+      authHistoryPushed = true;
+    }
   }
-  function closeAuthModal() {
+  let authHistoryPushed = false;
+  function closeAuthModal(fromPopstate) {
+    // 뒤로가기 외의 경로(취소/바깥 클릭/로그인 성공)로 닫을 때는 history 항목을 직접 제거
+    if (authHistoryPushed) {
+      authHistoryPushed = false;
+      if (fromPopstate !== true) {
+        skipPopCount++;
+        history.back();
+      }
+    }
     document.getElementById('authModal').classList.remove('open');
   }
 
@@ -1025,7 +1077,7 @@
       openAuthModal();
     }
   });
-  document.getElementById('authCancelBtn').addEventListener('click', closeAuthModal);
+  document.getElementById('authCancelBtn').addEventListener('click', () => closeAuthModal());
   document.getElementById('authModal').addEventListener('click', e => {
     if (e.target.id === 'authModal') closeAuthModal();
   });
@@ -1468,6 +1520,23 @@
     { val:'보류',  color:'#b0b8c8', textColor:'#fff' },
   ];
 
+  // idx번 메모를 '내용이 있는 메모들 중 맨 아래'로 옮긴다 (이미 맨 아래거나 빈 메모면 그대로)
+  function moveRowToBottomOfFilled(data, idx) {
+    const hasContent = i => !!((data.lines[i] || '').trim() || (data.details[i] || '').trim());
+    if (isNaN(idx) || !hasContent(idx)) return;
+    let lastOther = -1;
+    for (let j = 0; j < LINE_COUNT; j++) {
+      if (j !== idx && hasContent(j)) lastOther = j;
+    }
+    if (lastOther < idx) return; // 이미 가장 아래
+    if (!data.status1) data.status1 = Array(LINE_COUNT).fill('');
+    if (!data.status2) data.status2 = Array(LINE_COUNT).fill('');
+    ['lines', 'details', 'checked', 'persons', 'status1', 'status2'].forEach(f => {
+      const [item] = data[f].splice(idx, 1);
+      data[f].splice(lastOther, 0, item);
+    });
+  }
+
   function makeStatusSlot(currentVal, row) {
     const wrap = document.createElement('div');
     wrap.style.position = 'relative';
@@ -1511,7 +1580,10 @@
         badge.textContent = item.val;
         badge.className = 'st-badge has-val';
         dropdown.classList.remove('open');
-        saveData(curYear, curMonth, selectedDay, collectCurrentData());
+        const newData = collectCurrentData();
+        // '완료' 선택 시: 내용이 있는 메모 중 가장 아래로 자동 이동
+        if (item.val === '완료') moveRowToBottomOfFilled(newData, parseInt(row.dataset.index));
+        saveData(curYear, curMonth, selectedDay, newData).catch(() => {});
         pushUndo(before);
       });
       dropdown.appendChild(el);
@@ -1531,7 +1603,7 @@
   }
 
   // ── 날짜 상단 휴무/인원 미니 보드 (3칸, 각 칸 = 휴무상태+인원, 날짜별 독립 저장) ──
-  const OFF_STATUS_ITEMS = ['연차', '휴무', '오전', '오후'];
+  const OFF_STATUS_ITEMS = ['연차', '휴무', '오전', '오후', '근무'];
   const OFF_PERSON_ITEMS = ['성민', '동혁', '태진', '규형', '성호', '홍식', '서진', '황', '용수'];
 
   function updateOffValue(idx, field, val) {
@@ -1797,15 +1869,10 @@
       moveSelect.appendChild(opt);
     }
 
-    // 날짜 옵션 (해당 메모 기준 이전 10일 ~ 이후 한달)
-    const baseDate = (selectedDay === SPECIAL_TAB || selectedDay === BORU_TAB)
-      ? new Date()
-      : new Date(curYear, curMonth, selectedDay);
-    baseDate.setHours(0, 0, 0, 0);
-
-    const rangeStart = new Date(baseDate);
-    rangeStart.setDate(rangeStart.getDate() - 10);
-    const rangeEnd = new Date(baseDate);
+    // 날짜 옵션: 과거는 제외하고 오늘부터 한 달 후까지만
+    const rangeStart = new Date();
+    rangeStart.setHours(0, 0, 0, 0);
+    const rangeEnd = new Date(rangeStart);
     rangeEnd.setMonth(rangeEnd.getMonth() + 1);
 
     const DAYS_KO2 = ['일','월','화','수','목','금','토'];
@@ -1828,12 +1895,31 @@
     document.getElementById('mainScreen').classList.add('slide-out');
     document.getElementById('detailScreen').classList.add('slide-in');
 
+    // 안드로이드 뒤로가기 지원: 상세 화면 진입 시 history 항목을 1개 쌓는다
+    if (!detailHistoryPushed) {
+      history.pushState({ screen: 'detail' }, '');
+      detailHistoryPushed = true;
+    }
+
     setTimeout(() => {
       document.getElementById('detailTitleInput').focus();
     }, 320);
   }
 
-  function closeDetail() {
+  // 상세 화면용 history 항목이 쌓여 있는지 / 무시해야 할 popstate 횟수
+  let detailHistoryPushed = false;
+  let skipPopCount = 0;
+
+  function closeDetail(fromPopstate) {
+    // 뒤로가기(popstate)가 아닌 경로(뒤로 버튼, 이동, 되돌리기)로 닫을 때는
+    // 쌓아둔 history 항목을 직접 제거해서 스택이 어긋나지 않게 한다
+    if (detailHistoryPushed) {
+      detailHistoryPushed = false;
+      if (fromPopstate !== true) {
+        skipPopCount++;
+        history.back();
+      }
+    }
     document.getElementById('mainScreen').classList.remove('slide-out');
     document.getElementById('detailScreen').classList.remove('slide-in');
 
@@ -2053,14 +2139,21 @@
   });
 
   // 안드로이드 뒤로가기 버튼 지원
+  // 상세 화면이 열려 있을 때 뒤로가기 → 저장 후 목록 화면으로 복귀 (앱이 종료되지 않음)
   window.addEventListener('popstate', async () => {
-    if (document.getElementById('detailScreen').classList.contains('slide-in')) {
+    // closeDetail()이 직접 history.back()을 호출해서 생긴 popstate는 무시
+    if (skipPopCount > 0) { skipPopCount--; return; }
+    // 로그인 모달이 열려 있으면 모달만 닫는다
+    if (document.getElementById('authModal').classList.contains('open')) {
+      closeAuthModal(true);
+      return;
+    }
+    const detail = document.getElementById('detailScreen');
+    if (detail.classList.contains('slide-in')) {
       await saveDetail();
-      closeDetail();
+      closeDetail(true);
     }
   });
-  // 상세 열릴 때 history 스택 추가
-  const _openDetail = openDetail;
 
   // 드롭다운 외부 클릭 시 닫기
   document.addEventListener('click', () => {
@@ -2228,6 +2321,18 @@
       endDrag(true);
     });
   })();
+
+  // 글쓰기 버튼: 현재 탭에서 첫 번째 빈 메모칸을 열어 바로 쓸 수 있게 한다
+  document.getElementById('writeBtn').addEventListener('click', () => {
+    if (!isEditor) return;
+    const data = loadData(curYear, curMonth, selectedDay);
+    const emptyIdx = data.lines.findIndex((l, i) => !(l || '').trim() && !(data.details[i] || '').trim());
+    if (emptyIdx < 0) {
+      alert('메모칸이 모두 찼습니다.\n기존 메모를 삭제하거나 다른 날짜로 이동한 뒤 다시 시도하세요.');
+      return;
+    }
+    openDetail(emptyIdx);
+  });
 
   // 되돌리기 버튼
   document.getElementById('undoBtnMain').addEventListener('click', performUndo);
