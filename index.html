@@ -1204,6 +1204,7 @@
   let curMonth = now.getMonth();
   let selectedDay = now.getDate();
   let detailIndex = -1; // 현재 열린 상세 인덱스
+  let detailIsNew = false; // 글쓰기 버튼으로 연 새 메모인지 (첫 저장 시 맨 위로 이동)
 
   // ── 스토리지 ──
   const storageKey = (y, m, d) => d === SPECIAL_TAB ? CHEOLSU_KEY : d === BORU_TAB ? BORU_KEY : `sched_${y}_${m+1}_${d}`;
@@ -1824,23 +1825,26 @@
   // ── 상세 화면 열기/닫기 ──
   let detailEditSnapshot = null; // 상세화면 진입 시점의 "변경 전" 상태 (첫 저장에만 undo로 등록)
 
-  function openDetail(index) {
+  // 상세 화면 상단 제목 (탭/날짜 · 번호)
+  function setDetailHeader(index) {
+    let t;
+    if (selectedDay === SPECIAL_TAB) t = `철수 · ${index+1}번`;
+    else if (selectedDay === BORU_TAB) t = `보류 · ${index+1}번`;
+    else t = `${curMonth+1}월 ${selectedDay}일 · ${index+1}번`;
+    document.getElementById('detailHeaderTitle').textContent = t;
+  }
+
+  // isNew: 글쓰기 버튼으로 연 새 메모 → 처음 내용이 저장될 때 목록 맨 위로 올린다
+  function openDetail(index, isNew) {
     detailIndex = index;
+    detailIsNew = !!isNew;
     detailEditSnapshot = snapshotFor(curYear, curMonth, selectedDay);
     const data = loadData(curYear, curMonth, selectedDay);
     const title = data.lines[index] || '';
     const content = data.details[index] || '';
     const isDone = data.checked[index] || false;
 
-    // 헤더 타이틀
-    if (selectedDay === SPECIAL_TAB) {
-      document.getElementById('detailHeaderTitle').textContent = `철수 · ${index+1}번`;
-    } else if (selectedDay === BORU_TAB) {
-      document.getElementById('detailHeaderTitle').textContent = `보류 · ${index+1}번`;
-    } else {
-      document.getElementById('detailHeaderTitle').textContent =
-        `${curMonth+1}월 ${selectedDay}일 · ${index+1}번`;
-    }
+    setDetailHeader(index);
 
     document.getElementById('detailTitleInput').value = title;
     document.getElementById('detailContent').value = content;
@@ -1929,7 +1933,14 @@
     detailEditSnapshot = null;
   }
 
-  async function saveDetail() {
+  // 저장 요청이 겹치지 않도록 한 줄로 세운다 (앞 저장이 끝나 캐시가 갱신된 뒤에 다음 저장 실행)
+  let saveDetailChain = Promise.resolve();
+  function saveDetail() {
+    saveDetailChain = saveDetailChain.then(saveDetailImpl, saveDetailImpl);
+    return saveDetailChain;
+  }
+
+  async function saveDetailImpl() {
     if (detailIndex < 0) return;
     if (!isEditor) return;
     const titleVal = document.getElementById('detailTitleInput').value;
@@ -1945,6 +1956,20 @@
     data.details[detailIndex] = contentVal;
     data.checked[detailIndex] = isDone;
 
+    // 글쓰기 버튼으로 만든 새 메모: 처음 내용이 들어가는 순간 목록 맨 위로 올린다
+    const prevIndex = detailIndex, prevIsNew = detailIsNew;
+    if (detailIsNew && (displayTitle.trim() || contentVal.trim())) {
+      if (detailIndex > 0) {
+        ['lines', 'details', 'checked', 'persons', 'status1', 'status2'].forEach(f => {
+          const [item] = data[f].splice(detailIndex, 1);
+          data[f].unshift(item);
+        });
+        detailIndex = 0;
+        setDetailHeader(0);
+      }
+      detailIsNew = false;
+    }
+
     const msg = document.getElementById('detailSavedMsg');
     msg.textContent = '저장 중…';
     msg.style.opacity = '1';
@@ -1955,6 +1980,9 @@
       await saveData(curYear, curMonth, selectedDay, data);
     } catch (e) {
       // 저장 실패는 _fbSave에서 이미 alert로 알림. 여기서는 상태 메시지만 정리.
+      // 위치를 먼저 바꿔뒀다면 원래대로 돌려놓아 다음 저장 때 엉뚱한 칸을 덮지 않게 한다.
+      detailIndex = prevIndex; detailIsNew = prevIsNew;
+      setDetailHeader(prevIndex);
       msg.style.opacity = '0';
       return;
     }
@@ -1982,38 +2010,11 @@
   });
 
   // 이동 버튼
-  document.getElementById('detailMoveBtn').addEventListener('click', () => {
-    if (detailIndex < 0) return;
+  let moving = false;
+  document.getElementById('detailMoveBtn').addEventListener('click', async () => {
+    if (detailIndex < 0 || !isEditor || moving) return;
     const val = document.getElementById('detailMoveTarget').value;
     if (!val) { alert('이동할 대상을 선택하세요.'); return; }
-
-    // 내용 저장 + 이동을 하나의 undo 단계로 묶기 위해
-    // 이동 전 원본 상태를 먼저 떠두고, saveDetail이 별도로 undo를 등록하지 않도록 비워둔다
-    const srcBefore = snapshotFor(curYear, curMonth, selectedDay);
-    detailEditSnapshot = null;
-
-    // 현재 항목 데이터 저장 먼저
-    saveDetail();
-
-    // 현재 위치에서 데이터 꺼내기
-    const srcData = loadData(curYear, curMonth, selectedDay);
-    if (!srcData.status1) srcData.status1 = Array(LINE_COUNT).fill('');
-    if (!srcData.status2) srcData.status2 = Array(LINE_COUNT).fill('');
-    const moveLine    = srcData.lines[detailIndex];
-    const moveDetail  = srcData.details[detailIndex];
-    const moveChecked = srcData.checked[detailIndex];
-    const movePerson  = srcData.persons[detailIndex];
-    const moveStatus1 = srcData.status1[detailIndex];
-    const moveStatus2 = srcData.status2[detailIndex];
-
-    // 현재 위치에서 빈 칸으로 교체 (맨 뒤로) - 선택란도 메모란과 함께 당겨지도록 동일하게 처리
-    srcData.lines.splice(detailIndex, 1);    srcData.lines.push('');
-    srcData.details.splice(detailIndex, 1);  srcData.details.push('');
-    srcData.checked.splice(detailIndex, 1);  srcData.checked.push(false);
-    srcData.persons.splice(detailIndex, 1);  srcData.persons.push('');
-    srcData.status1.splice(detailIndex, 1);  srcData.status1.push('');
-    srcData.status2.splice(detailIndex, 1);  srcData.status2.push('');
-    saveData(curYear, curMonth, selectedDay, srcData);
 
     // 대상 결정
     let destY = curYear, destM = curMonth, destD;
@@ -2026,40 +2027,60 @@
       destY = parseInt(parts[1]); destM = parseInt(parts[2]); destD = parseInt(parts[3]);
     }
 
-    // 대상에 추가 (첫 빈 슬롯에)
-    const destBefore = snapshotFor(destY, destM, destD);
-    const destData = loadData(destY, destM, destD);
-    if (!destData.status1) destData.status1 = Array(LINE_COUNT).fill('');
-    if (!destData.status2) destData.status2 = Array(LINE_COUNT).fill('');
-    const emptyIdx = destData.lines.findIndex(l => !l);
-    const insertIdx = emptyIdx >= 0 ? emptyIdx : destData.lines.length;
-    if (emptyIdx >= 0) {
-      destData.lines[insertIdx]   = moveLine;
-      destData.details[insertIdx] = moveDetail;
-      destData.checked[insertIdx] = moveChecked;
-      destData.persons[insertIdx] = movePerson;
-      destData.status1[insertIdx] = moveStatus1;
-      destData.status2[insertIdx] = moveStatus2;
-    } else {
-      destData.lines.push(moveLine);
-      destData.details.push(moveDetail);
-      destData.checked.push(moveChecked);
-      destData.persons.push(movePerson);
-      destData.status1.push(moveStatus1);
-      destData.status2.push(moveStatus2);
+    // 대상에 빈 칸이 없으면 이동하지 않는다 (넘치는 메모가 잘려 사라지는 것을 방지)
+    const destCheck = loadData(destY, destM, destD);
+    const hasRoom = destCheck.lines.some((l, i) => !(l || '').trim() && !(destCheck.details[i] || '').trim());
+    if (!hasRoom) {
+      alert('이동할 곳의 메모칸이 가득 찼습니다.\n그곳의 메모를 정리한 뒤 다시 시도하세요.');
+      return;
     }
-    saveData(destY, destM, destD, destData);
-    pushUndo(srcBefore, destBefore);
 
-    // 이동 완료 메시지
-    let destLabel;
-    if (destD === SPECIAL_TAB) destLabel = '철수';
-    else if (destD === BORU_TAB) destLabel = '보류';
-    else destLabel = `${destY}년 ${destM+1}월 ${destD}일`;
-    alert(`✓ "${moveLine || '(빈 메모)'}"을(를) [${destLabel}]로 이동했습니다.`);
+    moving = true;
+    try {
+      // 내용 저장 + 이동을 하나의 undo 단계로 묶기 위해 이동 전 원본 상태를 먼저 떠둔다
+      const srcBefore = detailEditSnapshot || snapshotFor(curYear, curMonth, selectedDay);
+      detailEditSnapshot = null;
+      clearTimeout(autoSaveTimer);
 
-    // 상세 화면 닫기
-    closeDetail();
+      // 지금 입력한 내용까지 저장이 끝난 뒤(캐시 갱신 후) 이동 처리
+      await saveDetail();
+
+      const srcData = loadData(curYear, curMonth, selectedDay);
+      const idx = detailIndex;
+      const fields = ['lines', 'details', 'checked', 'persons', 'status1', 'status2'];
+      const moved = {};
+      fields.forEach(f => { moved[f] = srcData[f][idx]; });
+
+      // 출발지: 해당 칸을 빼고 아래 칸들을 위로 당김
+      fields.forEach(f => {
+        srcData[f].splice(idx, 1);
+        srcData[f].push(f === 'checked' ? false : '');
+      });
+      await saveData(curYear, curMonth, selectedDay, srcData);
+
+      // 도착지: 맨 위에 넣고, 첫 번째 빈 칸을 하나 없애 전체 개수를 유지
+      const destBefore = snapshotFor(destY, destM, destD);
+      const destData = loadData(destY, destM, destD);
+      const emptyIdx = destData.lines.findIndex((l, i) => !(l || '').trim() && !(destData.details[i] || '').trim());
+      fields.forEach(f => {
+        if (emptyIdx >= 0) destData[f].splice(emptyIdx, 1);
+        destData[f].unshift(moved[f]);
+      });
+      await saveData(destY, destM, destD, destData);
+      pushUndo(srcBefore, destBefore);
+
+      // 이동 완료 메시지
+      let destLabel;
+      if (destD === SPECIAL_TAB) destLabel = '철수';
+      else if (destD === BORU_TAB) destLabel = '보류';
+      else destLabel = `${destY}년 ${destM+1}월 ${destD}일`;
+      alert(`✓ "${moved.lines || '(빈 메모)'}"을(를) [${destLabel}]의 맨 위로 이동했습니다.`);
+
+      // 상세 화면 닫기
+      closeDetail();
+    } finally {
+      moving = false;
+    }
   });
 
   // 상세 저장 버튼
@@ -2331,7 +2352,7 @@
       alert('메모칸이 모두 찼습니다.\n기존 메모를 삭제하거나 다른 날짜로 이동한 뒤 다시 시도하세요.');
       return;
     }
-    openDetail(emptyIdx);
+    openDetail(emptyIdx, true);
   });
 
   // 되돌리기 버튼
